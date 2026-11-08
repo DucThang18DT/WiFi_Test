@@ -88,7 +88,16 @@ int main(int argc, char *argv[]) {
   std::string roleStr = cfg.count("Role") ? cfg["Role"] : "Server";
   std::string typeStr = cfg.count("Type") ? cfg["Type"] : "TCP";
   std::string ip = cfg.count("ServerAddr") ? cfg["ServerAddr"] : "127.0.0.1";
-  int port = cfg.count("Port") ? std::stoi(cfg["Port"]) : 8080;
+  int port = 8080;
+
+  try {
+    if (cfg.count("Port")) {
+      port = std::stoi(cfg["Port"]);
+    }
+  } catch (const std::exception &) {
+    std::cerr << "Invalid Port in config: " << cfg["Port"] << std::endl;
+    return 1;
+  }
 
   WL_Socket::Type type = (typeStr == "TCP" || typeStr == "tcp")
                              ? WL_Socket::Type::TCP
@@ -104,11 +113,24 @@ int main(int argc, char *argv[]) {
   WL_Socket socket(type, role, 1);
   g_socket = &socket;
 
+  socket.Start();
+
+  double rateMbps = 0.0;
+
   if (role == WL_Socket::Role::SERVER) {
-    socket.server_bandwidth_test(port, 5, 64 * 1024);
+    std::cout << "Starting server bandwidth test [" << typeStr << "] on port "
+              << port << std::endl;
+    rateMbps = socket.server_bandwidth_test(port, 5, 64 * 1024);
   } else {
-    socket.client_bandwidth_test(ip, port, 5, 1024 * 1024);
+    const std::size_t payload_size =
+        (type == WL_Socket::Type::UDP) ? 1400u : 1024u * 1024u;
+    std::cout << "Starting client bandwidth test [" << typeStr << "] to " << ip
+              << ":" << port << " payload=" << payload_size << std::endl;
+    rateMbps = socket.client_bandwidth_test(ip, port, 5, payload_size);
   }
 
+  std::cout << "Bandwidth: " << rateMbps << " Mb/s" << std::endl;
+
+  socket.Stop();
   return 0;
 }
