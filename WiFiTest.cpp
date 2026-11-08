@@ -113,7 +113,7 @@ int main(int argc, char *argv[]) {
   WL_Socket socket(type, role, 1);
   g_socket = &socket;
 
-  socket.Start();
+  // socket.Start();
 
   double rateMbps = 0.0;
 
