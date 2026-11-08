@@ -10,6 +10,13 @@
 #include <unistd.h>
 #include <vector>
 
+namespace {
+static double now_seconds() {
+  using clock = std::chrono::steady_clock;
+  return std::chrono::duration<double>(clock::now().time_since_epoch()).count();
+}
+} // namespace
+
 WL_Socket::WL_Socket(Type type, Role role, int socketOption)
     : type_(type), role_(role), socketOption_(socketOption), socket_(-1) {
   socket_ = socket(AF_INET, (type_ == TCP ? SOCK_STREAM : SOCK_DGRAM), 0);
@@ -153,132 +160,133 @@ bool WL_Socket::Receive(std::string &data) {
 double WL_Socket::client_bandwidth_test(const std::string &server_ip, int port,
                                         std::size_t duration_seconds,
                                         std::size_t payload_size) {
-  if (type_ != TCP || role_ != CLIENT) {
-    std::cerr << "client_bandwidth_test requires TCP client socket."
-              << std::endl;
-    return -1.0;
+  if (payload_size == 0 || duration_seconds == 0) {
+    return 0.0;
   }
 
-  sockaddr_in serverAddress{};
-  std::memset(&serverAddress, 0, sizeof(serverAddress));
-  serverAddress.sin_family = AF_INET;
-  serverAddress.sin_port = htons(port);
+  std::string payload(payload_size, 'A');
 
-  if (inet_pton(AF_INET, server_ip.c_str(), &serverAddress.sin_addr) != 1) {
-    std::cerr << "Invalid server IP address." << std::endl;
-    return -1.0;
+  struct sockaddr_in server_addr{};
+  server_addr.sin_family = AF_INET;
+  server_addr.sin_port = htons(static_cast<uint16_t>(port));
+  if (inet_pton(AF_INET, server_ip.c_str(), &server_addr.sin_addr) != 1) {
+    return 0.0;
   }
 
-  if (connect(socket_, reinterpret_cast<sockaddr *>(&serverAddress),
-              sizeof(serverAddress)) == -1) {
-    std::cerr << "Error connecting to server: " << std::strerror(errno)
-              << std::endl;
-    return -1.0;
+  int fd = socket(AF_INET, (type_ == UDP) ? SOCK_DGRAM : SOCK_STREAM,
+                  (type_ == UDP) ? IPPROTO_UDP : IPPROTO_TCP);
+  if (fd < 0) {
+    return 0.0;
   }
 
-  std::vector<char> payload(payload_size, 'A');
-  auto start = std::chrono::steady_clock::now();
-  long long total = 0;
+  if (type_ == TCP) {
+    if (::connect(fd, reinterpret_cast<sockaddr *>(&server_addr),
+                  sizeof(server_addr)) < 0) {
+      ::close(fd);
+      return 0.0;
+    }
+  } else {
+    if (::connect(fd, reinterpret_cast<sockaddr *>(&server_addr),
+                  sizeof(server_addr)) < 0) {
+      ::close(fd);
+      return 0.0;
+    }
+  }
 
-  while (true) {
-    auto now = std::chrono::steady_clock::now();
-    double elapsed = std::chrono::duration<double>(now - start).count();
+  const double start = now_seconds();
+  const double deadline = start + static_cast<double>(duration_seconds);
 
-    if (elapsed >= static_cast<double>(duration_seconds)) {
+  std::size_t total_sent = 0;
+
+  while (now_seconds() < deadline) {
+    const ssize_t n = ::send(fd, payload.data(), payload.size(), 0);
+    if (n < 0) {
+      if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        continue;
+      }
       break;
     }
-
-    ssize_t sent = send(socket_, payload.data(), payload.size(), 0);
-    if (sent <= 0) {
-      break;
-    }
-
-    total += sent;
+    total_sent += static_cast<std::size_t>(n);
   }
 
-  char ack[32];
-  std::memset(ack, 0, sizeof(ack));
-  recv(socket_, ack, sizeof(ack) - 1, 0);
+  ::close(fd);
 
-  auto end = std::chrono::steady_clock::now();
-  double elapsed = std::chrono::duration<double>(end - start).count();
-
-  double throughput = elapsed > 0.0 ? total / (1024.0 * 1024.0 * elapsed) : 0.0;
-
-  std::cout << "Client sent: " << total << " bytes" << std::endl;
-  std::cout << "Client throughput: " << throughput << " MB/s" << std::endl;
-
-  return throughput;
+  const double elapsed = std::max(0.0, now_seconds() - start);
+  return (elapsed > 0.0) ? (static_cast<double>(total_sent) / elapsed) : 0.0;
 }
 
 double WL_Socket::server_bandwidth_test(int port, std::size_t duration_seconds,
                                         std::size_t buffer_size) {
-  if (type_ != TCP || role_ != SERVER) {
-    std::cerr << "server_bandwidth_test requires TCP server socket."
-              << std::endl;
-    return -1.0;
+  if (buffer_size == 0 || duration_seconds == 0) {
+    return 0.0;
   }
 
-  sockaddr_in serverAddress{};
-  std::memset(&serverAddress, 0, sizeof(serverAddress));
-  serverAddress.sin_family = AF_INET;
-  serverAddress.sin_addr.s_addr = INADDR_ANY;
-  serverAddress.sin_port = htons(port);
-
-  if (bind(socket_, reinterpret_cast<sockaddr *>(&serverAddress),
-           sizeof(serverAddress)) == -1) {
-    std::cerr << "Error binding socket: " << std::strerror(errno) << std::endl;
-    return -1.0;
+  int fd = socket(AF_INET, (type_ == UDP) ? SOCK_DGRAM : SOCK_STREAM,
+                  (type_ == UDP) ? IPPROTO_UDP : IPPROTO_TCP);
+  if (fd < 0) {
+    return 0.0;
   }
 
-  if (listen(socket_, 5) == -1) {
-    std::cerr << "Error listening: " << std::strerror(errno) << std::endl;
-    return -1.0;
+  int opt = 1;
+  setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+  sockaddr_in addr{};
+  addr.sin_family = AF_INET;
+  addr.sin_port = htons(static_cast<uint16_t>(port));
+  addr.sin_addr.s_addr = htonl(INADDR_ANY);
+
+  if (::bind(fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) < 0) {
+    ::close(fd);
+    return 0.0;
   }
 
-  sockaddr_in clientAddress{};
-  socklen_t clientSize = sizeof(clientAddress);
+  std::size_t total_received = 0;
+  std::vector<char> buffer(buffer_size);
 
-  int clientSocket = accept(
-      socket_, reinterpret_cast<sockaddr *>(&clientAddress), &clientSize);
-  if (clientSocket == -1) {
-    std::cerr << "Error accepting connection: " << std::strerror(errno)
-              << std::endl;
-    return -1.0;
-  }
+  const double start = now_seconds();
+  const double deadline = start + static_cast<double>(duration_seconds);
 
-  std::vector<char> buffer(buffer_size, 0);
-  auto start = std::chrono::steady_clock::now();
-  long long total = 0;
+  if (type_ == UDP) {
+    while (now_seconds() < deadline) {
+      sockaddr_in from{};
+      socklen_t from_len = sizeof(from);
 
-  while (true) {
-    auto now = std::chrono::steady_clock::now();
-    double elapsed = std::chrono::duration<double>(now - start).count();
+      ssize_t n = ::recvfrom(fd, buffer.data(), buffer.size(), 0,
+                             reinterpret_cast<sockaddr *>(&from), &from_len);
 
-    if (elapsed >= static_cast<double>(duration_seconds)) {
-      break;
+      if (n > 0) {
+        total_received += static_cast<std::size_t>(n);
+      } else if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+        break;
+      }
+    }
+  } else {
+    if (::listen(fd, 1) < 0) {
+      ::close(fd);
+      return 0.0;
     }
 
-    ssize_t received = recv(clientSocket, buffer.data(), buffer.size(), 0);
-    if (received <= 0) {
-      break;
+    int client_fd = ::accept(fd, nullptr, nullptr);
+    if (client_fd < 0) {
+      ::close(fd);
+      return 0.0;
     }
 
-    total += received;
+    while (now_seconds() < deadline) {
+      ssize_t n = ::recv(client_fd, buffer.data(), buffer.size(), 0);
+      if (n > 0) {
+        total_received += static_cast<std::size_t>(n);
+      } else if (n <= 0) {
+        break;
+      }
+    }
+
+    ::close(client_fd);
   }
 
-  auto end = std::chrono::steady_clock::now();
-  double elapsed = std::chrono::duration<double>(end - start).count();
+  ::close(fd);
 
-  const std::string ok = "OK";
-  send(clientSocket, ok.c_str(), ok.size(), 0);
-
-  close(clientSocket);
-
-  double throughput = elapsed > 0.0 ? total / (1024.0 * 1024.0 * elapsed) : 0.0;
-
-  std::cout << "Server received: " << total << " bytes" << std::endl;
-  std::cout << "Server throughput: " << throughput << " MB/s" << std::endl;
-
-  return throughput;
+  const double elapsed = std::max(0.0, now_seconds() - start);
+  return (elapsed > 0.0) ? (static_cast<double>(total_received) / elapsed)
+                         : 0.0;
 }

@@ -104,15 +104,10 @@ int main(int argc, char *argv[]) {
   WL_Socket socket(type, role, 1);
   g_socket = &socket;
 
-  if (type == WL_Socket::Type::TCP) {
-    if (role == WL_Socket::Role::SERVER) {
-      socket.server_bandwidth_test(port, 5, 64 * 1024);
-    } else {
-      socket.client_bandwidth_test(ip, port, 5, 1024 * 1024);
-    }
+  if (role == WL_Socket::Role::SERVER) {
+    socket.server_bandwidth_test(port, 5, 64 * 1024);
   } else {
-    std::cerr << "Only TCP is supported for bandwidth test." << std::endl;
-    return 1;
+    socket.client_bandwidth_test(ip, port, 5, 1024 * 1024);
   }
 
   return 0;
